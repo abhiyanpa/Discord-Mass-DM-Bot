@@ -15,14 +15,18 @@ A powerful Discord bot for sending mass DMs with advanced rate-limiting, emoji s
 ## **Installation**
 
 1. Clone the repository from GitHub.
-2. Install required dependencies using `pip install`.
-3. Create a `.env` file with your bot token:
+2. Install required dependencies using
+```bash
+pip install -r requirements.txt.
+```
+4. Create a `.env` file with your bot token:
 ```bash
 DISCORD_TOKEN=your_token_here
 ```
 4. Run the bot script.
 ```bash
-python3 bot.py```
+python3 bot.py
+```
 
 ## **Commands**
 
