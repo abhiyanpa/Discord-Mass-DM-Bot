@@ -7,6 +7,9 @@ import asyncio
 import re
 import logging
 import random
+import concurrent.futures
+from itertools import islice
+import time
 from asyncio import Queue, Semaphore
 from datetime import datetime, timedelta
 
@@ -29,88 +32,57 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 
+def create_progress_bar(current, total, length=20):
+    """
+    Creates a fancy progress bar with unicode blocks
+    """
+    filled = int(length * current / total)
+    fill_char = "█"
+    empty_char = "░"
+    percentage = (current / total * 100)
+    bar = fill_char * filled + empty_char * (length - filled)
+    return f"Progress: {bar} | {current}/{total} ({percentage:.1f}%)"
+
 class RateLimitHandler:
     def __init__(self):
-        self.message_queue = Queue()
-        self.global_semaphore = Semaphore(50)  # 50 messages per second global
+        self.message_queue = asyncio.Queue()
+        self.global_semaphore = asyncio.Semaphore(50)
         self.user_semaphores = {}
         self.last_messages = {}
-        self.daily_dm_count = 0
-        self.daily_reset_time = datetime.now()
-        
-    async def add_to_queue(self, member, content=None, embed=None):
-        await self.message_queue.put((member, content, embed))
-        
-    async def process_queue(self):
-        if self.message_queue.empty():
-            return True
-            
-        member, content, embed = await self.message_queue.get()
-        
-        # Check daily limit
-        current_time = datetime.now()
-        if current_time - self.daily_reset_time > timedelta(days=1):
-            self.daily_dm_count = 0
-            self.daily_reset_time = current_time
-        
-        if self.daily_dm_count >= 4900:  # Leave some buffer
-            logging.warning("Daily DM limit approaching, pausing for 24 hours")
-            return False
-            
-        # Get or create user semaphore
-        if member.id not in self.user_semaphores:
-            self.user_semaphores[member.id] = Semaphore(1)
-            
+        self.workers = 10
+
+    async def process_member(self, member, content=None, embed=None):
         try:
-            # Acquire both global and user-specific rate limit
-            async with self.global_semaphore:
-                async with self.user_semaphores[member.id]:
-                    # Check user's last message time
-                    last_time = self.last_messages.get(member.id, 0)
-                    if datetime.now().timestamp() - last_time < 5:  # 5 second cooldown per user
-                        await asyncio.sleep(5)
-                        
-                    try:
-                        if content:
-                            await member.send(content=content)
-                        if embed:
-                            await member.send(embed=embed)
-                        
-                        self.last_messages[member.id] = datetime.now().timestamp()
-                        self.daily_dm_count += 1
-                        
-                        # Add random delay between messages (100-300ms)
-                        await asyncio.sleep(random.uniform(0.1, 0.3))
-                        
-                        return True
-                        
-                    except discord.Forbidden:
-                        logging.warning(f"Cannot send DM to {member} - DMs disabled")
-                        return False
-                    except discord.HTTPException as e:
-                        if e.code == 50007:  # Cannot send messages to this user
-                            logging.warning(f"Cannot send DM to {member} - {e}")
-                            return False
-                        elif e.status == 429:  # Rate limited
-                            retry_after = e.retry_after
-                            logging.warning(f"Rate limited. Waiting {retry_after} seconds")
-                            await asyncio.sleep(retry_after)
-                            return await self.process_queue()  # Retry
-                        else:
-                            logging.error(f"Error sending DM to {member}: {e}")
-                            return False
-                            
+            if member != bot.user:
+                if content:
+                    await member.send(content=content)
+                if embed:
+                    await member.send(embed=embed)
+                await asyncio.sleep(0.05)
+                return True
+        except discord.Forbidden:
+            logging.warning(f"Cannot send DM to {member} - DMs disabled")
         except Exception as e:
-            logging.error(f"Unexpected error processing queue: {e}")
-            return False
+            logging.error(f"Error sending DM to {member}: {e}")
+        return False
+
+    async def process_chunk(self, members, content=None, embed=None):
+        tasks = []
+        for member in members:
+            task = asyncio.create_task(self.process_member(member, content, embed))
+            tasks.append(task)
+            if len(tasks) >= self.workers:
+                await asyncio.gather(*tasks)
+                tasks = []
+        if tasks:
+            await asyncio.gather(*tasks)
 
 class EmojiStore:
     def __init__(self):
-        self.emojis = set()  # Store unique emoji strings
-        self.emoji_objects = {}  # Store emoji objects by ID
+        self.emojis = set()
+        self.emoji_objects = {}
 
     def add_emoji(self, emoji):
-        # For custom emojis (both static and animated)
         if hasattr(emoji, 'id'):
             emoji_str = f'<{"a:" if emoji.animated else ":"}{emoji.name}:{emoji.id}>'
             self.emojis.add(emoji_str)
@@ -120,35 +92,14 @@ class EmojiStore:
         if not content:
             return
             
-        # Extract emoji patterns from message content
         emoji_pattern = r'<(a?):([^:]+):(\d+)>'
         emoji_matches = re.finditer(emoji_pattern, content)
         
         for match in emoji_matches:
-            # Store the full emoji pattern
-            emoji_str = match.group(0)  # The complete emoji string
+            emoji_str = match.group(0)
             self.emojis.add(emoji_str)
 
 emoji_store = EmojiStore()
-
-def sanitize_text(text: str) -> str:
-    """
-    Preserve server emojis while sanitizing other text
-    """
-    sanitized_text = text
-    
-    # Temporarily replace all known server emojis
-    for i, emoji in enumerate(emoji_store.emojis):
-        sanitized_text = sanitized_text.replace(emoji, f"EMOJI_{i}")
-    
-    # Remove any other emoji-like patterns that aren't from our server
-    sanitized_text = re.sub(r'<a?:.+?:\d+>', '', sanitized_text)
-    
-    # Restore our server emojis
-    for i, emoji in enumerate(emoji_store.emojis):
-        sanitized_text = sanitized_text.replace(f"EMOJI_{i}", emoji)
-            
-    return sanitized_text
 
 class ConfirmView(discord.ui.View):
     def __init__(self):
@@ -168,9 +119,6 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 async def send_mass_dm(interaction: discord.Interaction, embed=None, content=None):
-    """
-    Helper function to send mass DMs with rate limiting
-    """
     confirm_embed = discord.Embed(
         title="Confirm DM Blast",
         description=f"Are you sure you want to send this DM blast to **{interaction.guild.member_count}** members?",
@@ -188,64 +136,68 @@ async def send_mass_dm(interaction: discord.Interaction, embed=None, content=Non
         success_count = 0
         failed_count = 0
         progress_message = None
+        start_time = time.time()
+
+        # Process in smaller chunks
+        chunk_size = 100
+        members = [m for m in interaction.guild.members if not m.bot]
+        total_members = len(members)
         
-        # Split members into chunks of 1000
-        member_chunks = [list(interaction.guild.members)[i:i + 1000] for i in range(0, len(interaction.guild.members), 1000)]
-        
-        for chunk_index, chunk in enumerate(member_chunks):
-            chunk_success = 0
-            chunk_failed = 0
+        for i in range(0, total_members, chunk_size):
+            chunk = members[i:i + chunk_size]
+            chunk_start = time.time()
             
-            # Add all members in chunk to queue
+            tasks = []
             for member in chunk:
-                if member != bot.user:
-                    await rate_limiter.add_to_queue(member, content, embed)
+                task = asyncio.create_task(rate_limiter.process_member(member, content, embed))
+                tasks.append(task)
             
-            # Process queue for this chunk
-            while not rate_limiter.message_queue.empty():
-                result = await rate_limiter.process_queue()
-                if result:
-                    chunk_success += 1
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            success_count += sum(1 for r in results if r is True)
+            failed_count += sum(1 for r in results if r is False)
+
+            # Update progress
+            elapsed = time.time() - start_time
+            speed = (i + len(chunk)) / elapsed if elapsed > 0 else 0
+            eta = (total_members - (i + len(chunk))) / speed if speed > 0 else 0
+            
+            progress_text = create_progress_bar(i + len(chunk), total_members)
+            stats = f"\nSuccess: {success_count} | Failed: {failed_count}"
+            speed_text = f"\nSpeed: {speed:.1f} DMs/sec | ETA: {eta/60:.1f} minutes"
+            
+            try:
+                if not progress_message:
+                    progress_message = await interaction.followup.send(
+                        progress_text + stats + speed_text)
                 else:
-                    chunk_failed += 1
-                    
-                # Update progress
-                current_total = (chunk_index * 1000) + chunk_success + chunk_failed
-                if current_total % 10 == 0 or current_total == interaction.guild.member_count:
-                    if not progress_message:
-                        progress_message = await interaction.followup.send(
-                            f"Progress: {current_total}/{interaction.guild.member_count}\n"
-                            f"Current Chunk: {chunk_index + 1}/{len(member_chunks)}")
-                    else:
-                        await progress_message.edit(content=
-                            f"Progress: {current_total}/{interaction.guild.member_count}\n"
-                            f"Current Chunk: {chunk_index + 1}/{len(member_chunks)}")
-            
-            success_count += chunk_success
-            failed_count += chunk_failed
-            
-            # Add delay between chunks
-            if chunk_index < len(member_chunks) - 1:
-                await asyncio.sleep(5)  # 5 second delay between chunks
+                    await progress_message.edit(content=
+                        progress_text + stats + speed_text)
+            except:
+                continue
 
-        log_message = f"DM blast completed.\nSuccessful: {success_count}\nFailed: {failed_count}\nTotal: {interaction.guild.member_count}"
+            await asyncio.sleep(0.1)
+
+        total_time = time.time() - start_time
+        log_message = (
+            f"DM blast completed in {total_time/60:.1f} minutes.\n"
+            f"Successful: {success_count}\nFailed: {failed_count}\n"
+            f"Total: {total_members}\n"
+            f"Average Speed: {total_members/total_time:.1f} DMs/sec"
+        )
+        
         await interaction.followup.send(log_message)
-
+        
         with open("dmblast_log.txt", "a") as log_file:
             log_file.write(f"[{interaction.created_at}] {interaction.user} - {log_message}\n")
-    else:  # Cancelled
+    else:
         await interaction.edit_original_response(content="DM blast cancelled.", view=None)
 
 async def fetch_all_emojis():
-    """Fetch emojis from all available sources"""
-    # Clear existing emojis to prevent duplicates on reload
     emoji_store.emojis.clear()
     emoji_store.emoji_objects.clear()
 
-    # Fetch from all servers the bot is in
     for guild in bot.guilds:
         try:
-            # Ensure we have the latest emoji list
             await guild.fetch_emojis()
             for emoji in guild.emojis:
                 emoji_store.add_emoji(emoji)
@@ -280,21 +232,9 @@ async def dmall(interaction: discord.Interaction, title: str, description: str, 
         return
 
     try:
-        color = int(color, 16)  # Convert color from hex string to integer
+        color = int(color, 16)
     except ValueError:
-        color = discord.Color.default()  # Use default color if invalid hex string provided
-
-    # Sanitize all text inputs
-    title = sanitize_text(title)
-    description = sanitize_text(description)
-    footer = sanitize_text(footer)
-    field1_name = sanitize_text(field1_name)
-    field1_value = sanitize_text(field1_value)
-    
-    if field2_name is not None:
-        field2_name = sanitize_text(field2_name)
-    if field2_value is not None:
-        field2_value = sanitize_text(field2_value)
+        color = discord.Color.default()
 
     embed = discord.Embed(
         title=title,
@@ -320,36 +260,30 @@ async def dmallmessageid(interaction: discord.Interaction, message_link_or_id: s
         return
 
     try:
-        # Handle both message links and IDs
         if 'discord.com/channels/' in message_link_or_id:
-            # Extract IDs from message link
             parts = message_link_or_id.split('/')
             guild_id = int(parts[-3])
             channel_id = int(parts[-2])
             message_id = int(parts[-1])
         else:
-            # Use current channel if only message ID is provided
             guild_id = interaction.guild_id
             channel_id = interaction.channel_id
             message_id = int(message_link_or_id)
 
-        # Get the channel and message
         channel = bot.get_channel(channel_id)
         if not channel:
             channel = await bot.fetch_channel(channel_id)
         
         message = await channel.fetch_message(message_id)
         
-        # Extract and store emojis from the message content
         if message.content:
             emoji_store.add_from_message(message.content)
-            content = message.content  # Keep original content with emoji formats
+            content = message.content
         else:
             content = None
 
         if message.embeds:
             embed = message.embeds[0]
-            # Keep original embed as is
             if embed.description:
                 emoji_store.add_from_message(embed.description)
             if embed.title:
@@ -362,9 +296,8 @@ async def dmallmessageid(interaction: discord.Interaction, message_link_or_id: s
         else:
             embed = None
             
-        # If message has reactions, store those emojis too
         for reaction in message.reactions:
-            if hasattr(reaction.emoji, 'id'):  # Custom emoji
+            if hasattr(reaction.emoji, 'id'):
                 emoji_store.add_emoji(reaction.emoji)
 
         if not content and not embed:
@@ -378,6 +311,6 @@ async def dmallmessageid(interaction: discord.Interaction, message_link_or_id: s
     except (ValueError, IndexError):
         await interaction.response.send_message("Invalid message link or ID format. Please try again.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+        await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
 
 bot.run(TOKEN)
