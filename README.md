@@ -21,6 +21,8 @@ A powerful Discord bot for sending mass DMs with advanced rate-limiting, emoji s
 DISCORD_TOKEN=your_token_here
 ```
 4. Run the bot script.
+```bash
+python3 bot.py```
 
 ## **Commands**
 
